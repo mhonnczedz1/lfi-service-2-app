@@ -1,0 +1,47 @@
+# Configuration for this repo's dev tooling only. Nothing here describes the
+# application: there is no [project] table and no build backend, because
+# service-2 ships as a container image, not as a Python package. Runtime
+# dependencies live in requirements.txt, dev ones in requirements-dev.txt.
+
+# ---------------------------------------------------------------------------
+# pytest. Picked up automatically by a bare `pytest` run from the repo root.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# Run async test functions without decorating each one with
+# @pytest.mark.asyncio. Almost every test here is async, because the suite
+# drives the app in-process through httpx.AsyncClient.
+asyncio_mode = "auto"
+# Required from pytest-asyncio 1.x. Leave it unset and every run prints a
+# deprecation warning. "function" is the historical default, so setting it
+# explicitly changes no behaviour, it just silences the warning.
+asyncio_default_fixture_loop_scope = "function"
+# Where to collect tests from. This narrows collection, nothing more. The
+# separate reason `from src.main import ...` resolves is tests/__init__.py:
+# it makes pytest walk up to the repo root and put that on sys.path.
+testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------
+# ruff: linter and import sorter, invoked as `ruff check src tests`.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+# Tells ruff it may assume 3.12 syntax exists. This is what lets the UP rules
+# below suggest modern replacements instead of staying silent.
+target-version = "py312"
+
+[tool.ruff.lint]
+# E   pycodestyle errors: the formatting basics
+# F   pyflakes: real problems, such as unused imports and undefined names
+# I   isort: keeps import blocks ordered and grouped
+# UP  pyupgrade: flags syntax that 3.12 has a cleaner form for
+# B   bugbear: likely-bug patterns, such as mutable default arguments
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's Depends/Query/Path in argument defaults is the framework's
+# intended style, not the mutable-default bug B008 exists to catch.
+extend-immutable-calls = [
+  "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body",
+  "fastapi.Header", "fastapi.Cookie", "fastapi.File", "fastapi.Form",
+  "fastapi.Security",
+]

@@ -18,6 +18,13 @@ permissions:
   contents: read
   packages: write
 
+# Add at the top level of the workflow, alongside 'on:' and 'env:'.
+# Serialises promotions from THIS repo. Cross-repo races are handled
+# by the rebase retry loop in the job below.
+concurrency:
+  group: promote-${{ github.repository }}
+  cancel-in-progress: false
+
 # The image name, deliberately without the `lfi-` repo prefix. It has to match
 # the `newName` in the GitOps repo's kustomization.yaml or the promote step in
 # Section 8 will update a tag nothing is using.
@@ -93,3 +100,60 @@ jobs:
           # slow under emulation and this is what makes it bearable.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  promote:
+    name: promote to gitops
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the GitOps repo
+        uses: actions/checkout@v7
+        with:
+          # A different repo from the one running this workflow, hence the PAT.
+          repository: ${{ github.repository_owner }}/lfi-infrastructure-gitops
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Update the image tag and push
+        working-directory: gitops
+        env:
+          SHA: ${{ github.sha }}
+          # The ONLY line that differs from service-1's promote job. Getting
+          # this wrong means this pipeline overwrites service-1's tag, which
+          # Task 8.2.3 exists to catch.
+          SERVICE: service-2
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          MANIFEST="kubernetes/${SERVICE}/kustomization.yaml"
+
+          # The one-field edit that constitutes the deployment.
+          yq -i '.images[0].newTag = strenv(SHA)' "$MANIFEST"
+
+          # A re-run of the same commit is a no-op, not a failure.
+          if git diff --quiet; then
+            echo "Tag already at ${SHA}. Nothing to promote."
+            exit 0
+          fi
+
+          git add "$MANIFEST"
+          git commit -m "deploy(${SERVICE}): ${SHA}"
+
+          # Rebase-and-retry, because service-1 may be pushing to this same
+          # repo right now. See Task 8.2.1 for why this is expected.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Promoted ${SERVICE} to ${SHA} on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}). Rebasing and retrying..."
+            git pull --rebase --autostash
+            sleep $(( attempt * 3 ))
+          done
+
+          echo "Could not push after 5 attempts." >&2
+          exit 1

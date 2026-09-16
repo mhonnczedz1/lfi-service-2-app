@@ -67,6 +67,19 @@ jobs:
     # merged commit on main produces something deployable.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+
+    # Computing the next ordinal is a read-modify-write against GHCR: read the
+    # highest 26W38B* tag, push one higher. Two overlapping runs would both
+    # read B2 and both push B3, and the loser's image would be unreachable.
+    # A DIFFERENT group name from the promote job: two jobs in one run sharing
+    # a group, where one `needs` the other, deadlock.
+    concurrency:
+      group: build-${{ github.repository }}
+      cancel-in-progress: false
+
+    outputs:
+      build_tag: ${{ steps.tag.outputs.build_tag }}
+
     steps:
       - uses: actions/checkout@v7
 
@@ -85,6 +98,38 @@ jobs:
           # Automatically provided. No secret to create for this step.
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute the build tag
+        id: tag
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # GHCR's v2 API wants a bearer that is the base64-encoded token, not
+          # the token itself. A registry quirk, not a general pattern.
+          BEARER="$(printf '%s' "$GHCR_TOKEN" | base64 -w0)"
+          URL="https://ghcr.io/v2/${OWNER}/${IMAGE_NAME}/tags/list?n=1000"
+
+          # Capture the status separately so a 404, meaning the package does
+          # not exist yet and this is the first ever build, is handled while
+          # anything else is loud. `curl -f` alone collapses those two cases.
+          RESPONSE="$(curl -sSL -w '\n%{http_code}' -H "Authorization: Bearer ${BEARER}" "$URL")"
+          CODE="$(tail -n1 <<<"$RESPONSE")"
+          BODY="$(sed '$d' <<<"$RESPONSE")"
+
+          case "$CODE" in
+            200) TAGS="$(jq -r '.tags[]? // empty' <<<"$BODY")" ;;
+            404) echo "No existing package; this is the first build."; TAGS="" ;;
+            *)   echo "ERROR: GHCR tag list returned HTTP ${CODE}" >&2
+                 echo "$BODY" >&2
+                 exit 1 ;;
+          esac
+
+          BUILD_TAG="$(printf '%s\n' "$TAGS" | ci/next-build-tag.sh)"
+          echo "Build tag: ${BUILD_TAG}"
+          echo "build_tag=${BUILD_TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -92,10 +137,17 @@ jobs:
           # Two architectures: amd64 for CI and most cloud, arm64 for your Mac.
           platforms: linux/amd64,linux/arm64
           push: true
-          # Tagged with the full commit SHA, never `latest`. This is what makes
-          # a running pod traceable to exactly one commit, and what lets
-          # Kubernetes tell that the image genuinely changed.
-          tags: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Two tags, one image. The build tag is what humans and the dev
+          # overlay use; the SHA tag is what keeps the image traceable back to
+          # a commit. The labels carry the same fact inside the image, so a
+          # running pod can be traced without consulting the registry at all.
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.build_tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.build_tag }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           # Layer cache in GitHub Actions storage. The arm64 build is
           # slow under emulation and this is what makes it bearable.
           cache-from: type=gha
@@ -118,7 +170,8 @@ jobs:
       - name: Update the image tag and push
         working-directory: gitops
         env:
-          SHA: ${{ github.sha }}
+          # Was SHA. The manifest names the build now, not the commit.
+          BUILD_TAG: ${{ needs.build.outputs.build_tag }}
           # The ONLY line that differs from service-1's promote job. Getting
           # this wrong means this pipeline overwrites service-1's tag, which
           # Task 8.2.3 exists to catch.
@@ -129,25 +182,33 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          MANIFEST="kubernetes/${SERVICE}/kustomization.yaml"
+          # Task 10.2.1 moved this. Writing to the old path keeps CI green
+          # while dev quietly stops receiving builds.
+          MANIFEST="kubernetes/overlays/dev/${SERVICE}/kustomization.yaml"
+
+          # yq -i against a missing file does not reliably fail, so check.
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "ERROR: ${MANIFEST} does not exist." >&2
+            exit 1
+          fi
 
           # The one-field edit that constitutes the deployment.
-          yq -i '.images[0].newTag = strenv(SHA)' "$MANIFEST"
+          yq -i '.images[0].newTag = strenv(BUILD_TAG)' "$MANIFEST"
 
           # A re-run of the same commit is a no-op, not a failure.
           if git diff --quiet; then
-            echo "Tag already at ${SHA}. Nothing to promote."
+            echo "Tag already at ${BUILD_TAG}. Nothing to promote."
             exit 0
           fi
 
           git add "$MANIFEST"
-          git commit -m "deploy(${SERVICE}): ${SHA}"
+          git commit -m "deploy(${SERVICE}): ${BUILD_TAG}"
 
           # Rebase-and-retry, because service-1 may be pushing to this same
           # repo right now. See Task 8.2.1 for why this is expected.
           for attempt in 1 2 3 4 5; do
             if git push; then
-              echo "Promoted ${SERVICE} to ${SHA} on attempt ${attempt}."
+              echo "Promoted ${SERVICE} to ${BUILD_TAG} on attempt ${attempt}."
               exit 0
             fi
             echo "Push rejected (attempt ${attempt}). Rebasing and retrying..."

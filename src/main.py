@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 # No lifespan handler, unlike service-1. This service opens no connections to
 # anything, so there is nothing to set up or tear down.
-app = FastAPI(title="service-2-worker", version="1.0.0")
+app = FastAPI(title="service-2-worker", version="1.1.0")
 
 
 # ---------------------------------------------------------------------------

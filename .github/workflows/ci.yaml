@@ -184,16 +184,25 @@ jobs:
 
           # Task 10.2.1 moved this. Writing to the old path keeps CI green
           # while dev quietly stops receiving builds.
-          MANIFEST="kubernetes/overlays/local/dev/${SERVICE}/kustomization.yaml"
+          MANIFESTS=(
+            "kubernetes/overlays/local/dev/${SERVICE}/kustomization.yaml"
+            "kubernetes/overlays/eks/dev/${SERVICE}/kustomization.yaml"
+          )
 
-          # yq -i against a missing file does not reliably fail, so check.
-          if [[ ! -f "$MANIFEST" ]]; then
-            echo "ERROR: ${MANIFEST} does not exist." >&2
-            exit 1
-          fi
+          # One build updates every tree, so local and EKS dev run the same
+          # build. Check every file exists before changing any of them.
+          for MANIFEST in "${MANIFESTS[@]}"; do
+            # yq -i against a missing file does not reliably fail, so check.
+            if [[ ! -f "$MANIFEST" ]]; then
+              echo "ERROR: ${MANIFEST} does not exist." >&2
+              exit 1
+            fi
+          done
 
-          # The one-field edit that constitutes the deployment.
-          yq -i '.images[0].newTag = strenv(BUILD_TAG)' "$MANIFEST"
+          # The one-field edit that constitutes the deployment, in each tree.
+          for MANIFEST in "${MANIFESTS[@]}"; do
+            yq -i '.images[0].newTag = strenv(BUILD_TAG)' "$MANIFEST"
+          done
 
           # A re-run of the same commit is a no-op, not a failure.
           if git diff --quiet; then
@@ -201,7 +210,7 @@ jobs:
             exit 0
           fi
 
-          git add "$MANIFEST"
+          git add "${MANIFESTS[@]}"
           git commit -m "deploy(${SERVICE}): ${BUILD_TAG}"
 
           # Rebase-and-retry, because service-1 may be pushing to this same
